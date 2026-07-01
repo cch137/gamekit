@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS / misc
+.DS_Store
+
+# Local config / secrets (in case tools gain saved settings later)
+*.local
+config.local.*
