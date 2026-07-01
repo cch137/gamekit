@@ -40,8 +40,17 @@ param(
     [double]$IdleTriggerMinutes = 5,
     # How often to re-evaluate, in seconds.
     [int]$CheckSeconds = 30,
-    # Virtual-key code of the harmless key to send. 0x7C = F13 (usually unbound).
-    [int]$KeyCode = 0x7C
+    # Virtual-key code to send. 0x7C = F13 (harmless, resets the client's raw
+    # idle timer). For games with their own AFK scripts that watch character
+    # movement, send a real action instead, e.g. 0x20 = Space (jump in place).
+    [int]$KeyCode = 0x7C,
+    # How long to hold the key down, in ms. A real press (not an instant tap)
+    # is more reliably registered as an in-game action like a jump.
+    [int]$KeyHoldMs = 80,
+    # Extra safety: nudge the mouse this many pixels and back during each poke,
+    # so AFK scripts that watch mouse/camera movement also see activity. The
+    # cursor is returned to its exact original position. 0 disables.
+    [int]$WigglePixels = 0
 )
 
 if ($ProcessName.Count -eq 0 -and [string]::IsNullOrEmpty($WindowTitle)) {
@@ -51,6 +60,7 @@ if ($ProcessName.Count -eq 0 -and [string]::IsNullOrEmpty($WindowTitle)) {
 
 Add-Type @"
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -62,15 +72,79 @@ public static class Afk {
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
     [DllImport("user32.dll")] static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("user32.dll")] static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] static extern uint MapVirtualKey(uint uCode, uint uMapType);
     [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("user32.dll")] static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int X, int Y);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll")] static extern uint GetTickCount();
 
     [StructLayout(LayoutKind.Sequential)]
     struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
 
     const int SW_RESTORE = 9;
     const uint KEYEVENTF_KEYUP = 0x0002;
+    const uint KEYEVENTF_SCANCODE = 0x0008;
+    const uint MOUSEEVENTF_MOVE = 0x0001;
+
+    // Hard ceiling for the whole focus->act->restore cycle. TAIL reserves time
+    // for the final ForceForeground(original) so the cycle never exceeds BUDGET.
+    const int BUDGET_MS = 500;
+    const int TAIL_MS = 50;
+
+    static readonly Random _rng = new Random();
+    static int Rand(int lo, int hi) { return _rng.Next(lo, hi + 1); }
+
+    // A jittered key-hold around the base value (never an instant tap).
+    static int HoldJitter(int baseMs) {
+        int lo = baseMs - 25; if (lo < 30) lo = 30;
+        return Rand(lo, baseMs + 35);
+    }
+
+    // Sleep for "want" ms, but shortened so the cycle stays within budget.
+    static void SleepBudgeted(Stopwatch sw, int want) {
+        int remaining = BUDGET_MS - TAIL_MS - (int)sw.ElapsedMilliseconds;
+        int s = want < remaining ? want : remaining;
+        if (s > 0) Thread.Sleep(s);
+    }
+
+    // Send a relative mouse move as genuine input (registers as movement).
+    static void MoveRel(int dx, int dy) {
+        INPUT[] inp = new INPUT[1];
+        inp[0].type = 0;  // INPUT_MOUSE
+        inp[0].mi.dx = dx; inp[0].mi.dy = dy;
+        inp[0].mi.dwFlags = MOUSEEVENTF_MOVE;
+        SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    // Nudge the mouse px pixels and back (with a jittered, budgeted gap), then
+    // snap the cursor to its exact original position (correcting edge-clamp drift).
+    static void WiggleMouse(int px, Stopwatch sw) {
+        if (px <= 0) return;
+        POINT p; GetCursorPos(out p);
+        MoveRel(px, px);
+        SleepBudgeted(sw, Rand(12, 40));
+        MoveRel(-px, -px);
+        SetCursorPos(p.X, p.Y);
+    }
+
+    // Press / release a key including its hardware scan code, so games that read
+    // raw/scancode input (not just virtual keys) register it.
+    static void KeyDown(byte vk) {
+        byte scan = (byte)MapVirtualKey(vk, 0);
+        keybd_event(vk, scan, KEYEVENTF_SCANCODE, UIntPtr.Zero);
+    }
+    static void KeyUp(byte vk) {
+        byte scan = (byte)MapVirtualKey(vk, 0);
+        keybd_event(vk, scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
+    }
 
     // Milliseconds since the last real keyboard/mouse input from the user.
     public static long IdleMillis() {
@@ -97,24 +171,31 @@ public static class Afk {
         AttachThreadInput(thisThread, foreThread, false);
     }
 
-    // Briefly focus the target window, send a key, restore original focus.
-    public static void Poke(IntPtr target, byte keyCode) {
-        if (target == IntPtr.Zero) return;
+    // Briefly focus the target window, send a key (+ optional mouse wiggle),
+    // then restore original focus. All delays are jittered and the whole cycle
+    // is bounded to BUDGET_MS. Returns the actual cycle duration in ms.
+    public static long Poke(IntPtr target, byte keyCode, int holdMs, int wigglePx) {
+        if (target == IntPtr.Zero) return 0;
         IntPtr original = GetForegroundWindow();
+        bool swap = (target != original);
+        Stopwatch sw = Stopwatch.StartNew();
 
-        if (target == original) {
-            keybd_event(keyCode, 0, 0, UIntPtr.Zero);
-            keybd_event(keyCode, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-            return;
+        if (swap) {
+            ForceForeground(target);
+            SleepBudgeted(sw, Rand(40, 75));   // let the target actually take focus
         }
 
-        ForceForeground(target);
-        Thread.Sleep(40);              // let the target actually take focus
-        keybd_event(keyCode, 0, 0, UIntPtr.Zero);
-        keybd_event(keyCode, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-        Thread.Sleep(10);
+        KeyDown(keyCode);
+        SleepBudgeted(sw, HoldJitter(holdMs)); // hold the key (e.g. a jump)
+        KeyUp(keyCode);
 
-        if (original != IntPtr.Zero) ForceForeground(original);
+        WiggleMouse(wigglePx, sw);
+
+        if (swap) {
+            SleepBudgeted(sw, Rand(8, 25));
+            if (original != IntPtr.Zero) ForceForeground(original);
+        }
+        return sw.ElapsedMilliseconds;
     }
 }
 "@
@@ -168,11 +249,11 @@ while ($true) {
     $opportunistic = ($idleMin -ge $IdleTriggerMinutes) -and ($sincePoke -ge $IdleTriggerMinutes)
 
     if ($forced -or $opportunistic) {
-        [Afk]::Poke([IntPtr]$target.Handle, [byte]$KeyCode)
+        $ms = [Afk]::Poke([IntPtr]$target.Handle, [byte]$KeyCode, [int]$KeyHoldMs, [int]$WigglePixels)
         $lastPoke = Get-Date
         $reason = if ($forced) { "forced ($([math]::Round($sincePoke,1))m since last)" }
                   else { "idle $([math]::Round($idleMin,1))m" }
-        Write-Host "$(Get-Date -Format 'HH:mm:ss') - poked '$($target.Name)' [$reason]"
+        Write-Host "$(Get-Date -Format 'HH:mm:ss') - poked '$($target.Name)' [$reason] (${ms}ms)"
     }
 
     Start-Sleep -Seconds $CheckSeconds
