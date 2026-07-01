@@ -12,13 +12,17 @@
 #      the target to the foreground, sends a harmless key, then restores focus
 #      to the window you were working in. The swap lasts a few dozen ms.
 #
-# Adaptive timing:
-#   - If you have been idle (no real keyboard/mouse) for >= IdleTriggerMinutes,
-#     it pokes opportunistically - while you're away, so nothing is disturbed.
-#   - Regardless of activity, it force-pokes once MaxIntervalMinutes has passed
-#     since the last poke, so the game never times out even while you work.
-#   Because idle periods top up the timer, the (mildly disruptive) forced poke
-#   rarely fires unless you are continuously active for the whole window.
+# Adaptive timing (all measured since the last poke):
+#   - No poke at all until (MaxIntervalMinutes - WindowMinutes) have passed, so
+#     pokes are always at least that far apart (10 min with the defaults).
+#   - Inside the trailing WindowMinutes window (10..15 min by default) a poke
+#     fires as soon as you've been idle long enough - but the required idle time
+#     decays linearly from IdleTriggerSeconds down to 0 as the force deadline
+#     nears. So early in the window it waits for ~1 min of idle; near the end
+#     almost any brief pause triggers it, catching you the moment you step away.
+#   - At MaxIntervalMinutes it force-pokes regardless of activity.
+#   The re-check interval is itself dynamic: coarse when far from the window,
+#   dense inside it, so idle moments are caught promptly without busy-looping.
 #
 # This script contains NO game-specific names. Launch it via a wrapper (e.g.
 # roblox.bat) that supplies the process/title for the game you want to keep
@@ -36,10 +40,18 @@ param(
     # Hard ceiling: force a poke once this many minutes have passed since the
     # last one, even if you are actively using the computer.
     [double]$MaxIntervalMinutes = 15,
-    # If you have been idle at least this long, poke opportunistically.
-    [double]$IdleTriggerMinutes = 5,
-    # How often to re-evaluate, in seconds.
-    [int]$CheckSeconds = 30,
+    # Length of the opportunistic window right before the force point. Pokes may
+    # only happen inside it, i.e. from (Max - Window) up to Max minutes since the
+    # last poke. Defaults give a 10..15 min window.
+    [double]$WindowMinutes = 5,
+    # Idle threshold (seconds) required at the START of the window. It decays
+    # linearly to 0 by the end, so a poke needs a full minute of idle early on
+    # but almost none as the deadline approaches.
+    [double]$IdleTriggerSeconds = 60,
+    # Dynamic re-check cadence bounds (seconds): coarse (up to Max) far from the
+    # window, dense (down to Min) inside it.
+    [int]$MinCheckSeconds = 5,
+    [int]$MaxCheckSeconds = 60,
     # Virtual-key code to send. 0x7C = F13 (harmless, resets the client's raw
     # idle timer). For games with their own AFK scripts that watch character
     # movement, send a real action instead, e.g. 0x20 = Space (jump in place).
@@ -146,6 +158,19 @@ public static class Afk {
         keybd_event(vk, scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, UIntPtr.Zero);
     }
 
+    // Pre-JIT the timing / input helpers so the first real Poke isn't slowed
+    // by one-time compilation (which can push it over budget). Side-effect free:
+    // no keystroke, no focus change, a 0-pixel mouse no-op restored in place.
+    public static void Warmup() {
+        Stopwatch sw = Stopwatch.StartNew();
+        int j = HoldJitter(80) + Rand(1, 2);
+        SleepBudgeted(sw, 1);
+        byte scan = (byte)MapVirtualKey(0x20, 0);
+        POINT p; GetCursorPos(out p);
+        MoveRel(0, 0);
+        SetCursorPos(p.X, p.Y);
+    }
+
     // Milliseconds since the last real keyboard/mouse input from the user.
     public static long IdleMillis() {
         LASTINPUTINFO lii = new LASTINPUTINFO();
@@ -227,34 +252,61 @@ function Resolve-TargetWindow {
     }
 }
 
+$windowStart = $MaxIntervalMinutes - $WindowMinutes   # min since last poke before pokes may fire
+
 $who = if ($ProcessName.Count) { $ProcessName -join ", " } else { "title:/$WindowTitle/" }
 Write-Host "Anti-AFK started. Target: $who"
-Write-Host "Force every $MaxIntervalMinutes min; opportunistic when idle >= $IdleTriggerMinutes min; checking every $CheckSeconds s."
+Write-Host "Poke window: $windowStart..$MaxIntervalMinutes min since last poke; idle needed decays ${IdleTriggerSeconds}s -> 0 across it; force at $MaxIntervalMinutes min."
+Write-Host "Dynamic re-check: $MinCheckSeconds..$MaxCheckSeconds s."
 Write-Host "Press Ctrl+C or close this window to stop."
 
+[Afk]::Warmup()                    # pre-JIT so the first poke stays within budget
 $lastPoke = [DateTime]::MinValue   # MinValue => poke on the first successful find
 
 while ($true) {
     $target = Resolve-TargetWindow
     if (-not $target) {
         Write-Host "$(Get-Date -Format 'HH:mm:ss') - waiting: target window not found (not running yet?)"
-        Start-Sleep -Seconds $CheckSeconds
+        Start-Sleep -Seconds $MaxCheckSeconds
         continue
     }
 
-    $idleMin = [Afk]::IdleMillis() / 60000.0
-    $sincePoke = ((Get-Date) - $lastPoke).TotalMinutes
+    $firstRun = ($lastPoke -eq [DateTime]::MinValue)
+    $idleSec = [Afk]::IdleMillis() / 1000.0
+    $sincePoke = if ($firstRun) { [double]::PositiveInfinity } else { ((Get-Date) - $lastPoke).TotalMinutes }
 
-    $forced = $sincePoke -ge $MaxIntervalMinutes
-    $opportunistic = ($idleMin -ge $IdleTriggerMinutes) -and ($sincePoke -ge $IdleTriggerMinutes)
+    # Decide whether to poke, and why.
+    $reason = $null
+    if ($firstRun) {
+        $reason = "first run"
+    } elseif ($sincePoke -ge $MaxIntervalMinutes) {
+        $reason = "forced ($([math]::Round($sincePoke,1))m)"
+    } elseif ($sincePoke -ge $windowStart) {
+        # Linear decay of the idle requirement across the window: full at the
+        # start, 0 at the force deadline.
+        $t = ($sincePoke - $windowStart) / $WindowMinutes            # 0..1
+        $requiredIdle = $IdleTriggerSeconds * (1 - $t)
+        if ($idleSec -ge $requiredIdle) {
+            $reason = "idle $([math]::Round($idleSec))s (needed $([math]::Round($requiredIdle))s)"
+        }
+    }
 
-    if ($forced -or $opportunistic) {
+    if ($reason) {
         $ms = [Afk]::Poke([IntPtr]$target.Handle, [byte]$KeyCode, [int]$KeyHoldMs, [int]$WigglePixels)
         $lastPoke = Get-Date
-        $reason = if ($forced) { "forced ($([math]::Round($sincePoke,1))m since last)" }
-                  else { "idle $([math]::Round($idleMin,1))m" }
+        $sincePoke = 0.0
         Write-Host "$(Get-Date -Format 'HH:mm:ss') - poked '$($target.Name)' [$reason] (${ms}ms)"
     }
 
-    Start-Sleep -Seconds $CheckSeconds
+    # Dynamic sleep until the next check.
+    if ($sincePoke -lt $windowStart) {
+        # Far from the window: coarse, but don't overshoot the window opening.
+        $secs = ($windowStart - $sincePoke) * 60
+        $sleep = [math]::Min($MaxCheckSeconds, [math]::Max($MinCheckSeconds, $secs))
+    } else {
+        # Inside the window: dense, tightening as the force deadline approaches.
+        $secs = ($MaxIntervalMinutes - $sincePoke) * 60
+        $sleep = [math]::Min(20, [math]::Max($MinCheckSeconds, $secs / 4))
+    }
+    Start-Sleep -Seconds ([int][math]::Ceiling($sleep))
 }
