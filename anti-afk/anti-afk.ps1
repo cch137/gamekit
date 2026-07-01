@@ -24,6 +24,12 @@
 #   The re-check interval is itself dynamic: coarse when far from the window,
 #   dense inside it, so idle moments are caught promptly without busy-looping.
 #
+#   If you are actively playing (the target IS the foreground window and you
+#   have given input since it was focused), your own input already keeps the
+#   game alive, so the poke is skipped - it never interrupts active play. That
+#   input is counted as a keepalive, so the next forced poke still lands within
+#   MaxIntervalMinutes of it, keeping you under the ~20 min disconnect limit.
+#
 # This script contains NO game-specific names. Launch it via a wrapper (e.g.
 # roblox.bat) that supplies the process/title for the game you want to keep
 # alive.
@@ -179,6 +185,11 @@ public static class Afk {
         return (uint)(GetTickCount() - lii.dwTime);
     }
 
+    // True if the given window is currently the foreground (focused) window.
+    public static bool IsForeground(IntPtr hWnd) {
+        return GetForegroundWindow() == hWnd;
+    }
+
     // Force a background window to the foreground, working around Windows'
     // foreground-lock by temporarily attaching input queues.
     static void ForceForeground(IntPtr hWnd) {
@@ -262,18 +273,38 @@ Write-Host "Press Ctrl+C or close this window to stop."
 
 [Afk]::Warmup()                    # pre-JIT so the first poke stays within budget
 $lastPoke = [DateTime]::MinValue   # MinValue => poke on the first successful find
+$focusedSince = $null              # when the target most recently became foreground
 
 while ($true) {
     $target = Resolve-TargetWindow
     if (-not $target) {
         Write-Host "$(Get-Date -Format 'HH:mm:ss') - waiting: target window not found (not running yet?)"
+        $focusedSince = $null
         Start-Sleep -Seconds $MaxCheckSeconds
         continue
     }
 
-    $firstRun = ($lastPoke -eq [DateTime]::MinValue)
+    $now = Get-Date
     $idleSec = [Afk]::IdleMillis() / 1000.0
-    $sincePoke = if ($firstRun) { [double]::PositiveInfinity } else { ((Get-Date) - $lastPoke).TotalMinutes }
+    $lastInput = $now.AddSeconds(-$idleSec)
+
+    # Track how long the target has been the foreground window (conservatively:
+    # dated to when we first observed it focused).
+    $focused = [Afk]::IsForeground([IntPtr]$target.Handle)
+    if ($focused) { if (-not $focusedSince) { $focusedSince = $now } }
+    else { $focusedSince = $null }
+
+    # If the user's most recent input happened AFTER the target became focused,
+    # that input reached the game and already reset its idle timer. Count it as
+    # a keepalive so we don't poke (interrupt) active play - while still keeping
+    # lastPoke anchored to a real input, so the force deadline stays < 20 min.
+    $userAlive = $focused -and $focusedSince -and ($lastInput -ge $focusedSince)
+    $preSince  = if ($lastPoke -eq [DateTime]::MinValue) { [double]::PositiveInfinity } `
+                 else { ($now - $lastPoke).TotalMinutes }
+    if ($userAlive -and ($lastInput -gt $lastPoke)) { $lastPoke = $lastInput }
+
+    $firstRun  = ($lastPoke -eq [DateTime]::MinValue)
+    $sincePoke = if ($firstRun) { [double]::PositiveInfinity } else { ($now - $lastPoke).TotalMinutes }
 
     # Decide whether to poke, and why.
     $reason = $null
@@ -296,6 +327,10 @@ while ($true) {
         $lastPoke = Get-Date
         $sincePoke = 0.0
         Write-Host "$(Get-Date -Format 'HH:mm:ss') - poked '$($target.Name)' [$reason] (${ms}ms)"
+    } elseif ($userAlive -and ($preSince -ge $windowStart)) {
+        # Would have poked, but you're actively playing - skip and let your own
+        # input keep it alive.
+        Write-Host "$(Get-Date -Format 'HH:mm:ss') - skip: active in $($target.Name) (idle $([math]::Round($idleSec))s)"
     }
 
     # Dynamic sleep until the next check.
