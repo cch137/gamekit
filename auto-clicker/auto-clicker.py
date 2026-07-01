@@ -5,14 +5,34 @@ Auto Clicker with a draggable, semi-transparent floating overlay.
 - Clicks wherever the mouse cursor currently is, at the configured rate.
 - Toggle clicking with the on-screen button or a user-configurable hotkey.
 - Drag the window by its top grip bar. Close with the X button.
+- Collapse to a small draggable icon with the "-" button; click the icon
+  to expand back, or right-click it to close.
+- Only one instance may run at a time.
 """
 
 import ctypes
+import sys
 import threading
 import time
 import tkinter as tk
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+SINGLE_INSTANCE_MUTEX_NAME = "Global\\GameKit_AutoClicker_SingleInstance"
+ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance_lock():
+    """Create a named mutex; if it already exists, another instance is
+    running. Returns the mutex handle to keep it alive for the process
+    lifetime (Windows releases it automatically on exit)."""
+    handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        user32.MessageBoxW(None, "Auto Clicker is already running.",
+                           "Auto Clicker", 0x40)  # MB_ICONINFORMATION
+        sys.exit(0)
+    return handle
 
 # mouse_event flags
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -51,6 +71,7 @@ class AutoClicker:
         self.stop_flag = False        # app shutting down
         self.hotkey_vk = 0x75         # default F6
         self.listening = False        # capturing a new hotkey
+        self.collapsed = False        # collapsed to a small icon
         self._build_ui()
         threading.Thread(target=self._click_loop, daemon=True).start()
         threading.Thread(target=self._hotkey_loop, daemon=True).start()
@@ -63,12 +84,21 @@ class AutoClicker:
         self.root.configure(bg="#1e1e1e")
         self.root.geometry("+200+200")
 
+        # main (expanded) view lives in its own frame so it can be swapped
+        # out for the mini icon view when collapsed.
+        self.main_frame = tk.Frame(self.root, bg="#1e1e1e")
+        self.main_frame.pack(fill="both", expand=True)
+
         # top grip bar (drag handle)
-        grip = tk.Frame(self.root, bg="#3a3a3a", height=22, cursor="fleur")
+        grip = tk.Frame(self.main_frame, bg="#3a3a3a", height=22, cursor="fleur")
         grip.pack(fill="x")
+        collapse = tk.Label(grip, text="–", bg="#3a3a3a", fg="#dddddd",
+                            font=("Segoe UI", 9, "bold"), cursor="hand2")
+        collapse.pack(side="left", padx=6)
+        collapse.bind("<Button-1>", lambda e: self._toggle_collapse())
         title = tk.Label(grip, text="Auto Clicker", bg="#3a3a3a", fg="#dddddd",
                          font=("Segoe UI", 9))
-        title.pack(side="left", padx=6)
+        title.pack(side="left")
         close = tk.Label(grip, text="X", bg="#3a3a3a", fg="#ff6b6b",
                          font=("Segoe UI", 9, "bold"), cursor="hand2")
         close.pack(side="right", padx=6)
@@ -77,7 +107,7 @@ class AutoClicker:
             w.bind("<Button-1>", self._start_drag)
             w.bind("<B1-Motion>", self._on_drag)
 
-        body = tk.Frame(self.root, bg="#1e1e1e")
+        body = tk.Frame(self.main_frame, bg="#1e1e1e")
         body.pack(fill="both", expand=True, padx=8, pady=6)
 
         # clicks-per-second + mouse button row
@@ -112,14 +142,51 @@ class AutoClicker:
         self.toggle_btn.pack(pady=(6, 0))
         self._refresh_toggle_text()
 
+        # mini (collapsed) view: a small draggable icon, built but not
+        # packed until the user collapses the window.
+        self.mini_frame = tk.Frame(self.root, bg="#1e1e1e")
+        self.mini_icon = tk.Label(self.mini_frame, text="AC", width=3,
+                                  bg="#2d7d46", fg="white", cursor="fleur",
+                                  font=("Segoe UI", 10, "bold"))
+        self.mini_icon.pack(padx=2, pady=2)
+        self.mini_icon.bind("<Button-1>", self._start_drag)
+        self.mini_icon.bind("<B1-Motion>", self._on_drag)
+        self.mini_icon.bind("<ButtonRelease-1>", self._end_drag)
+        self.mini_icon.bind("<Button-3>", lambda e: self.quit())
+        self._refresh_mini_icon()
+
+    # --- collapse/expand ---
+    def _toggle_collapse(self):
+        self.collapsed = not self.collapsed
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        if self.collapsed:
+            self.main_frame.pack_forget()
+            self.mini_frame.pack(fill="both", expand=True)
+        else:
+            self.mini_frame.pack_forget()
+            self.main_frame.pack(fill="both", expand=True)
+        self.root.update_idletasks()
+        w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _refresh_mini_icon(self):
+        self.mini_icon.config(bg="#a83232" if self.running else "#2d7d46")
+
     # --- dragging ---
     def _start_drag(self, e):
         self._dx, self._dy = e.x, e.y
+        self._drag_moved = False
 
     def _on_drag(self, e):
+        self._drag_moved = True
         x = self.root.winfo_pointerx() - self._dx
         y = self.root.winfo_pointery() - self._dy
         self.root.geometry(f"+{x}+{y}")
+
+    def _end_drag(self, e):
+        # a click (no movement) on the mini icon expands the window back
+        if not self._drag_moved:
+            self._toggle_collapse()
 
     # --- hotkey binding ---
     def _hotkey_name(self):
@@ -156,6 +223,7 @@ class AutoClicker:
         else:
             self.toggle_btn.config(bg="#2d7d46")
         self._refresh_toggle_text()
+        self._refresh_mini_icon()
 
     def _click_loop(self):
         while not self.stop_flag:
@@ -195,4 +263,5 @@ class AutoClicker:
 
 
 if __name__ == "__main__":
+    _mutex_handle = _acquire_single_instance_lock()
     AutoClicker().run()
