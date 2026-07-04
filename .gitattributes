@@ -1,0 +1,3 @@
+# macOS shell wrappers must keep LF endings, or they fail with
+# "/bin/bash^M: bad interpreter" when run on macOS.
+*.command text eol=lf
